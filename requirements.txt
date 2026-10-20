@@ -1,0 +1,6 @@
+﻿Flask
+requests
+Flask-SQLAlchemy>=3.1,<4
+psycopg[binary]>=3.2,<4
+gunicorn>=23,<24; sys_platform != "win32"
+faster-whisper>=1.1,<2
