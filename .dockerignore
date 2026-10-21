@@ -4,3 +4,4 @@ __pycache__
 *.py[cod]
 instance
 .git
+assets/images/*.jpg

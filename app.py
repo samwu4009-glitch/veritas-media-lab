@@ -4,7 +4,7 @@ import re
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID
@@ -34,6 +34,7 @@ def load_local_env(path):
 load_local_env(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 app = Flask(__name__, static_folder='assets', static_url_path='/assets')
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 86400
 database_url = os.environ.get('DATABASE_URL', 'sqlite:///veritas.db')
 if database_url.startswith('postgres://'):
     database_url = database_url.replace('postgres://', 'postgresql+psycopg://', 1)
@@ -46,6 +47,7 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {'pool_pre_ping': True}
 db = SQLAlchemy(app)
 DEEPSEEK_CHAT_URL = 'https://api.deepseek.com/chat/completions'
+DEEPSEEK_CHAT_MODEL = 'deepseek-flash'
 ASK_BILINGUAL_SEPARATOR = '中文辅助：'
 TRADITIONAL_CHINESE_PATTERN = re.compile(r'[體國學習後發現這裡為與對說開來時會點實驗證據資訊]')
 EVIDENCE_SCORE_WEIGHTS = {
@@ -191,17 +193,57 @@ def google_news_locale(language):
     }[language]
 
 
+def direct_get(url, **kwargs):
+    direct_session = requests.Session()
+    direct_session.trust_env = False
+    try:
+        return direct_session.get(url, **kwargs)
+    finally:
+        direct_session.close()
+
+
+def resilient_get(url, **kwargs):
+    # macOS system proxies are honored via trust_env; retry, then fall back to direct.
+    last_error = None
+    for attempt in range(2):
+        try:
+            return requests.get(url, **kwargs)
+        except (requests.exceptions.ProxyError, requests.exceptions.SSLError,
+                requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            last_error = exc
+            if attempt == 0:
+                time.sleep(1.5)
+    app.logger.warning('Request via system proxy failed for %s; retrying directly.', urlsplit(url).hostname)
+    try:
+        return direct_get(url, **kwargs)
+    except requests.RequestException:
+        raise last_error
+
+
+def fetch_xml(url, **kwargs):
+    response = resilient_get(url, **kwargs)
+    response.raise_for_status()
+    if len(response.content) > 2_000_000:
+        raise ValueError('Feed response exceeded the size limit.')
+    try:
+        return ET.fromstring(response.content)
+    except ET.ParseError:
+        # Some proxies return HTML error pages with HTTP 200; retry once directly.
+        app.logger.warning('Invalid XML via proxy for %s; retrying directly.', urlsplit(url).hostname)
+        response = direct_get(url, **kwargs)
+        response.raise_for_status()
+        if len(response.content) > 2_000_000:
+            raise ValueError('Feed response exceeded the size limit.')
+        return ET.fromstring(response.content)
+
+
 def search_google_news(query, language):
-    response = requests.get(
+    root = fetch_xml(
         GOOGLE_NEWS_SEARCH_URL,
         params={'q': query, **google_news_locale(language)},
         headers={'User-Agent': 'VeritasMediaLab/1.0 (news verification search)'},
         timeout=(8, 15),
     )
-    response.raise_for_status()
-    if len(response.content) > 2_000_000:
-        raise ValueError('Google News search response exceeded the size limit.')
-    root = ET.fromstring(response.content)
     results = []
     for item in root.findall('./channel/item'):
         title = (item.findtext('title') or '').strip()
@@ -242,16 +284,12 @@ def bing_article_url(url):
 
 def search_bing_news(query, language, limit=4):
     locale = {'zh-CN': 'zh-CN', 'zh-TW': 'zh-TW', 'en': 'en-US'}[language]
-    response = requests.get(
+    root = fetch_xml(
         BING_NEWS_SEARCH_URL,
         params={'q': query, 'format': 'RSS', 'setlang': locale},
         headers={'User-Agent': 'Mozilla/5.0 (compatible; VeritasMediaLab/1.0)'},
         timeout=(8, 15),
     )
-    response.raise_for_status()
-    if len(response.content) > 2_000_000:
-        raise ValueError('Bing News search response exceeded the size limit.')
-    root = ET.fromstring(response.content)
     results = []
     for item in root.findall('./channel/item'):
         title = (item.findtext('title') or '').strip()
@@ -290,16 +328,83 @@ def fetch_bing_news_feed(query, language, limit, image):
     } for source in search_bing_news(query, language, limit)]
 
 
+GDELT_DOC_API_URL = 'https://api.gdeltproject.org/api/v2/doc/doc'
+GDELT_MIN_INTERVAL_SECONDS = 12
+GDELT_LOCK = threading.Lock()
+GDELT_LAST_CALL_AT = 0.0
+
+
+def search_gdelt(query, language, limit=8):
+    """Query the GDELT DOC 2.0 API; it enforces one request per 5 seconds."""
+    global GDELT_LAST_CALL_AT
+    if not query:
+        return []
+    with GDELT_LOCK:
+        response = None
+        for attempt in range(2):
+            wait = GDELT_MIN_INTERVAL_SECONDS - (time.monotonic() - GDELT_LAST_CALL_AT)
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                response = resilient_get(
+                    GDELT_DOC_API_URL,
+                    params={
+                        'query': query,
+                        'mode': 'artlist',
+                        'maxrecords': limit,
+                        'format': 'json',
+                    },
+                    headers={'User-Agent': 'VeritasMediaLab/1.0 (news verification search)'},
+                    timeout=(8, 20),
+                )
+                GDELT_LAST_CALL_AT = time.monotonic()
+                if response.status_code == 429 and attempt == 0:
+                    app.logger.warning('GDELT rate-limited the search; retrying after a pause.')
+                    continue
+                break
+            except requests.RequestException:
+                GDELT_LAST_CALL_AT = time.monotonic()
+                if attempt == 1:
+                    raise
+        if response is None:
+            raise requests.RequestException('GDELT search did not produce a response.')
+    response.raise_for_status()
+    try:
+        data = response.json()
+    except ValueError:
+        return []
+    articles = data.get('articles') if isinstance(data, dict) else None
+    if not isinstance(articles, list):
+        return []
+    results = []
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        title = (article.get('title') or '').strip()
+        article_url = (article.get('url') or '').strip()
+        domain = source_domain(article_url)
+        if not title or not domain:
+            continue
+        source_name = (article.get('sourceCommonName') or domain).strip()
+        results.append({
+            'title': title[:400],
+            'url': article_url,
+            'publisher': source_name[:160],
+            'publisher_url': f'https://{domain}',
+            'domain': domain,
+            'tier': source_tier(domain),
+            'published_at': (article.get('seendate') or '')[:100],
+            'provider': 'GDELT',
+        })
+    return results
+
+
 def fetch_rss_news_feed(url, source_name, limit, image):
-    response = requests.get(
+    root = fetch_xml(
         url,
         headers={'User-Agent': 'Mozilla/5.0 (compatible; VeritasMediaLab/1.0)'},
         timeout=(8, 15),
     )
-    response.raise_for_status()
-    if len(response.content) > 2_000_000:
-        raise ValueError(f'{source_name} feed response exceeded the size limit.')
-    root = ET.fromstring(response.content)
     results = []
     for item in root.findall('./channel/item'):
         title = (item.findtext('title') or '').strip()
@@ -361,12 +466,28 @@ def search_claims_online(claims, language):
         ('Bing News', search_bing_news, query, search_language, matches)
         for (query, search_language), matches in query_claims.items()
     ]
+    # Query only the lead claim so results are never attributed to unrelated claims.
+    main_claim = claims[0]
+    main_claim_match = {'id': 'C1', 'claim': main_claim['claim']}
+    for query_key, gdelt_language in (('query_en', 'en'), ('query_local', language)):
+        query = main_claim.get(query_key)
+        if isinstance(query, str) and len(query.strip()) >= 4:
+            search_tasks.append((
+                'GDELT',
+                search_gdelt,
+                query.strip()[:180],
+                gdelt_language,
+                [main_claim_match],
+            ))
+    search_tasks.sort(key=lambda task: 0 if task[0] == 'GDELT' else 1)
     successful_searches = 0
-    results_by_query = {
-        query_spec: {'Google News': [], 'Bing News': []}
-        for query_spec in query_claims
-    }
-    with ThreadPoolExecutor(max_workers=min(len(search_tasks), MAX_ANALYSIS_CLAIMS * 4)) as executor:
+    results_by_query = {}
+    for query_spec in query_claims:
+        results_by_query[query_spec] = {'Google News': [], 'Bing News': []}
+    # Cap total search time so the request finishes within Cloudflare's ~100s proxy limit.
+    search_deadline = time.monotonic() + 50
+    executor = ThreadPoolExecutor(max_workers=min(len(search_tasks), MAX_ANALYSIS_CLAIMS * 2))
+    try:
         futures = [
             (
                 provider,
@@ -378,8 +499,12 @@ def search_claims_online(claims, language):
             for provider, search, query, search_language, matches in search_tasks
         ]
         for provider, query, search_language, matches, future in futures:
+            remaining = search_deadline - time.monotonic()
+            if remaining <= 0:
+                app.logger.warning('Online search deadline reached; skipping remaining results for %s.', provider)
+                break
             try:
-                for result in future.result():
+                for result in future.result(timeout=remaining):
                     result['matched_claims'] = matches
                     result['search_queries'] = [{
                         'claim_id': match['id'],
@@ -387,22 +512,36 @@ def search_claims_online(claims, language):
                         'language': search_language,
                     } for match in matches]
                     result['providers'] = [provider]
-                    results_by_query[(query, search_language)][provider].append(result)
+                    bucket = results_by_query.setdefault(
+                        (query, search_language), {'Google News': [], 'Bing News': []}
+                    )
+                    bucket.setdefault(provider, []).append(result)
                 successful_searches += 1
-            except (requests.RequestException, ET.ParseError, ValueError):
-                app.logger.warning('An online news provider verification search failed.')
+            except (requests.RequestException, ET.ParseError, ValueError) as exc:
+                status_code = getattr(getattr(exc, 'response', None), 'status_code', None)
+                app.logger.warning(
+                    'Online news provider verification search failed (%s, %s, HTTP %s).',
+                    provider,
+                    type(exc).__name__,
+                    status_code,
+                )
+            except FutureTimeoutError:
+                app.logger.warning('Online news provider verification search timed out (%s).', provider)
+    finally:
+        # Do not wait for stragglers; a stuck upstream must not hold the request hostage.
+        executor.shutdown(wait=False, cancel_futures=True)
 
     results = []
-    providers = ('Google News', 'Bing News')
-    query_specs = list(query_claims)
+    providers = ('Google News', 'Bing News', 'GDELT')
+    query_specs = list(results_by_query)
     result_index = 0
     while len(results) < MAX_SEARCH_RESULTS and any(
-        result_index < len(results_by_query[query_spec][provider])
+        result_index < len(results_by_query[query_spec].get(provider, []))
         for query_spec in query_specs for provider in providers
     ):
         for query_spec in query_specs:
             for provider in providers:
-                provider_results = results_by_query[query_spec][provider]
+                provider_results = results_by_query[query_spec].get(provider, [])
                 if result_index < len(provider_results):
                     results.append(provider_results[result_index])
                     if len(results) >= MAX_SEARCH_RESULTS:
@@ -655,27 +794,30 @@ def contains_traditional_chinese(text):
     return bool(TRADITIONAL_CHINESE_PATTERN.search(text))
 
 
-def call_deepseek(messages, max_tokens, temperature):
+def call_deepseek(messages, max_tokens, temperature, reasoning_effort=None):
     api_key = os.environ.get('DEEPSEEK_API_KEY')
     if not api_key:
         return None, (jsonify({'error': 'DeepSeek is not configured. Set DEEPSEEK_API_KEY before starting the server.'}), 503)
 
     headers = {'Authorization': f'Bearer {api_key}'}
     payload = {
-        'model': 'deepseek-chat',
+        'model': DEEPSEEK_CHAT_MODEL,
         'messages': messages,
         'max_tokens': max_tokens,
         'temperature': temperature,
+        'thinking': {'type': 'enabled' if reasoning_effort else 'disabled'},
     }
+    if reasoning_effort:
+        payload['reasoning_effort'] = reasoning_effort
     try:
         response = requests.post(
             DEEPSEEK_CHAT_URL,
             headers=headers,
             json=payload,
-            timeout=(8, 30),
+            timeout=(8, 90),
         )
-    except requests.exceptions.ProxyError:
-        app.logger.warning('Configured proxy is unavailable; retrying DeepSeek without the proxy.')
+    except requests.RequestException:
+        app.logger.warning('DeepSeek request through the configured network failed; retrying directly.')
         direct_session = requests.Session()
         direct_session.trust_env = False
         try:
@@ -683,11 +825,11 @@ def call_deepseek(messages, max_tokens, temperature):
                 DEEPSEEK_CHAT_URL,
                 headers=headers,
                 json=payload,
-                timeout=(8, 30),
+                timeout=(8, 90),
             )
         except requests.RequestException:
-            app.logger.exception('DeepSeek direct connection failed after proxy failure')
-            return None, (jsonify({'error': 'Could not reach DeepSeek through the configured proxy or a direct connection. Please check your network and try again.'}), 502)
+            app.logger.exception('DeepSeek direct connection failed after configured-network failure')
+            return None, (jsonify({'error': 'Could not reach DeepSeek through the configured network or a direct connection. Please check the server network and try again.'}), 502)
         finally:
             direct_session.close()
     except requests.RequestException:
@@ -1151,9 +1293,9 @@ def analyze_text():
 
     set_analysis_progress(progress_id, 'search')
     sources, successful_searches = search_claims_online(claims, language)
-    if not successful_searches:
-        app.logger.error('All online news provider searches failed for Truth Lab')
-        return jsonify({'error': 'Online search is unavailable right now. Check the server network and retry.'}), 502
+    search_unavailable = not successful_searches
+    if search_unavailable:
+        app.logger.error('All online news provider searches failed for Truth Lab; continuing without online evidence.')
 
     evidence_packet = [{
         'id': source['id'],
@@ -1170,7 +1312,7 @@ def analyze_text():
         'search_queries': source['search_queries'],
     } for source in sources]
     if language == 'en':
-        system_prompt = """You are Veritas Truth Lab. Analyze the submitted text using both SIFT (Stop, Investigate, Find, Trace) and PIE (Point, Illustration, Evidence). Google News and Bing News return indexed headlines, publisher names, dates, links, and the extracted claims/queries each result matched; the linked full articles have NOT been opened. The results list may be empty. Do not pretend otherwise or invent article contents, quotations, searches, or source reputations.
+        system_prompt = """You are Veritas Truth Lab. Analyze the submitted text using both SIFT (Stop, Investigate, Find, Trace) and PIE (Point, Illustration, Evidence). Google News and Bing News return indexed headlines; GDELT returns indexed article metadata. Results include publishers, dates, links, and the extracted claims/queries each result matched; the linked full articles have NOT been opened. The results list may be empty. Do not pretend otherwise or invent article contents, quotations, searches, or source reputations.
 
 Write an English report with these exact headings and every bold-labeled item. FORMAT: put each bold-labeled item on its own line as a bullet starting with "- " (for example "- **Stop:** ..."), keep each bullet to one or two sentences, and wrap the 1-2 most important key phrases of every bullet in ==double equals== markers (for example ==two independent outlets==). Never use == for anything else:
 SIFT | Verification steps:
@@ -1191,10 +1333,11 @@ Source IDs must be copied exactly from the supplied result list, and the three I
         user_content = json.dumps({
             'submitted_text': text,
             'extracted_claims': claims,
+            'online_search_available': not search_unavailable,
             'online_news_index_results': evidence_packet,
         }, ensure_ascii=False)
     else:
-        system_prompt = """你是 Veritas Truth Lab。必须同时依据 SIFT（Stop、Investigate、Find、Trace）和 PIE（Point、Illustration、Evidence）分析提交文本。Google News 或 Bing News 提供索引标题、发布者、日期、结果链接及结果匹配的主张/查询；没有打开链接中的完整报道。搜索结果列表可能为空。不得假装读过全文、编造报道内容、引语、搜索结果或信源信誉。
+        system_prompt = """你是 Veritas Truth Lab。必须同时依据 SIFT（Stop、Investigate、Find、Trace）和 PIE（Point、Illustration、Evidence）分析提交文本。Google News 和 Bing News 提供索引标题，GDELT 提供索引文章元数据；结果包含发布者、日期、链接及结果匹配的主张/查询；没有打开链接中的完整报道。搜索结果列表可能为空。不得假装读过全文、编造报道内容、引语、搜索结果或信源信誉。
 
 请用目标中文（简体或繁体）输出报告，并包含以下全部标题和加粗项目。格式要求：每个加粗项目单独成行，以“- ”开头分点列出（例如“- **Stop（停下）**：……”），每点一到两句话；并把每一点里最关键的 1-2 个词组用 ==双等号== 标出（例如 ==两家独立媒体==），不要把 == 用于其他用途：
 SIFT｜核查流程：
@@ -1215,6 +1358,7 @@ PIE｜文本与证据：
         user_content = json.dumps({
             '提交文本': text,
             '提取的可核查主张': claims,
+            '联网检索是否可用': not search_unavailable,
             '联网新闻索引结果': evidence_packet,
         }, ensure_ascii=False)
     REPORT_MAX_ATTEMPTS = 2
@@ -1227,6 +1371,7 @@ PIE｜文本与证据：
             ],
             max_tokens=2400,
             temperature=0,
+            reasoning_effort='high',
         )
         if error:
             return error
@@ -1309,7 +1454,30 @@ PIE｜文本与证据：
         set(relations['contradicting']) & main_claim_source_ids,
     )
     if verdict_code == 'unverified':
-        report_data['reason'], report_data['reason_zh'] = unverified_verdict_reasons(sources, language)
+        if search_unavailable:
+            reasons_by_language = {
+                'zh-CN': (
+                    '联网核查暂时不可用（搜索服务无法访问），本次只能依据提交文本本身进行 SIFT + PIE 分析，'
+                    '无法交叉验证。请稍后重试，或补充原始报道链接、日期和出处。',
+                    '聯網核查暫時不可用（搜尋服務無法訪問），本次只能依據提交文本本身進行 SIFT + PIE 分析，'
+                    '無法交叉驗證。請稍後重試，或補充原始報導連結、日期和出處。',
+                ),
+                'zh-TW': (
+                    '聯網查證暫時不可用（搜尋服務無法存取），本次只能依據提交文本本身進行 SIFT + PIE 分析，'
+                    '無法交叉驗證。請稍後重試，或補充原始報導連結、日期和出處。',
+                    '聯網查證暫時不可用（搜尋服務無法存取），本次只能依據提交文本本身進行 SIFT + PIE 分析，'
+                    '無法交叉驗證。請稍後重試，或補充原始報導連結、日期和出處。',
+                ),
+                'en': (
+                    'Online verification is temporarily unavailable (search services unreachable), so this report '
+                    'uses SIFT + PIE on the submitted text alone without cross-checking. Retry later or provide the '
+                    'original report link, date, and source.',
+                    '联网核查暂时不可用，本次仅依据提交文本进行分析，请稍后重试或补充原始出处。',
+                ),
+            }
+            report_data['reason'], report_data['reason_zh'] = reasons_by_language[language]
+        else:
+            report_data['reason'], report_data['reason_zh'] = unverified_verdict_reasons(sources, language)
     verdict_labels = {
         'zh-CN': {
             'true': '属实',
@@ -1371,15 +1539,16 @@ def analysis_progress(progress_id):
 
 NEWS_ITEMS_PER_SOURCE = 5
 MIN_NEWS_ITEMS_PER_SOURCE = 3
-GLOBAL_NEWS_IMAGE = 'https://images.pexels.com/photos/190538/pexels-photo-190538.jpeg?auto=compress&cs=tinysrgb&w=1200'
-LOCAL_NEWS_IMAGE = 'https://images.pexels.com/photos/8386440/pexels-photo-8386440.jpeg?auto=compress&cs=tinysrgb&w=400'
+NEWS_CACHE_TTL_SECONDS = 60
+NEWS_CACHE = None
+NEWS_CACHE_UPDATED_AT = 0
+NEWS_CACHE_LOCK = threading.Lock()
+GLOBAL_NEWS_IMAGE = '/assets/images/optimized/zoom.jpg'
+LOCAL_NEWS_IMAGE = '/assets/images/optimized/stack-2.jpg'
 
 
 def fetch_un_news(headers, limit):
-    r = requests.get('https://news.un.org/feed/subscribe/en/news/all/rss.xml', headers=headers, timeout=10)
-    r.raise_for_status()
-    r.encoding = 'utf-8'
-    root = ET.fromstring(r.content)
+    root = fetch_xml('https://news.un.org/feed/subscribe/en/news/all/rss.xml', headers=headers, timeout=10)
     items = []
     for item in root.findall('./channel/item'):
         title = item.find('title')
@@ -1405,7 +1574,7 @@ def fetch_un_news(headers, limit):
 def fetch_toutiao_news(headers, limit):
     tt_headers = headers.copy()
     tt_headers['Referer'] = 'https://www.toutiao.com/'
-    r = requests.get('https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc', headers=tt_headers, timeout=10)
+    r = resilient_get('https://www.toutiao.com/hot-event/hot-board/?origin=toutiao_pc', headers=tt_headers, timeout=10)
     r.raise_for_status()
     data = r.json()
     entries = data.get('data', []) if isinstance(data, dict) else []
@@ -1451,8 +1620,26 @@ def fill_news_section(news_data, key, label, primary, fallbacks, limit):
     news_data[key] = items[:limit]
 
 
+def fetch_news_section(key, label, primary, fallbacks, limit):
+    section_data = {'feed_sources': {}, 'status': {}}
+    fill_news_section(section_data, key, label, primary, fallbacks, limit)
+    return (
+        key,
+        section_data[key],
+        section_data['status'][key],
+        section_data['feed_sources'][key],
+    )
+
+
 @app.route('/api/news')
 def get_news():
+    global NEWS_CACHE, NEWS_CACHE_UPDATED_AT
+    with NEWS_CACHE_LOCK:
+        if NEWS_CACHE is not None and time.monotonic() - NEWS_CACHE_UPDATED_AT < NEWS_CACHE_TTL_SECONDS:
+            response = jsonify(NEWS_CACHE)
+            response.headers['Cache-Control'] = 'public, max-age=30, stale-while-revalidate=30'
+            return response
+
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -1461,24 +1648,36 @@ def get_news():
     limit = NEWS_ITEMS_PER_SOURCE
     news_data = {'unnews': [], 'toutiao': [], 'status': {}, 'feed_sources': {}}
 
-    fill_news_section(
-        news_data, 'unnews', 'UN News',
-        lambda n: fetch_un_news(headers, n),
-        [
-            ('Bing News', lambda: fetch_bing_news_feed('world news', 'en', limit * 2, GLOBAL_NEWS_IMAGE)),
-            ('中国新闻网', lambda: fetch_rss_news_feed(CHINANEWS_GLOBAL_RSS_URL, '中国新闻网', limit * 2, GLOBAL_NEWS_IMAGE)),
-        ],
-        limit,
-    )
-    fill_news_section(
-        news_data, 'toutiao', 'Toutiao',
-        lambda n: fetch_toutiao_news(headers, n),
-        [
-            ('Bing News', lambda: fetch_bing_news_feed('中国新闻', 'zh-CN', limit * 2, LOCAL_NEWS_IMAGE)),
-            ('中国新闻网', lambda: fetch_rss_news_feed(CHINANEWS_LOCAL_RSS_URL, '中国新闻网', limit * 2, LOCAL_NEWS_IMAGE)),
-        ],
-        limit,
-    )
+    sections = [
+        (
+            'unnews',
+            'UN News',
+            lambda n: fetch_un_news(headers, n),
+            [
+                ('Bing News', lambda: fetch_bing_news_feed('world news', 'en', limit * 2, GLOBAL_NEWS_IMAGE)),
+                ('中国新闻网', lambda: fetch_rss_news_feed(CHINANEWS_GLOBAL_RSS_URL, '中国新闻网', limit * 2, GLOBAL_NEWS_IMAGE)),
+            ],
+        ),
+        (
+            'toutiao',
+            'Toutiao',
+            lambda n: fetch_toutiao_news(headers, n),
+            [
+                ('Bing News', lambda: fetch_bing_news_feed('中国新闻', 'zh-CN', limit * 2, LOCAL_NEWS_IMAGE)),
+                ('中国新闻网', lambda: fetch_rss_news_feed(CHINANEWS_LOCAL_RSS_URL, '中国新闻网', limit * 2, LOCAL_NEWS_IMAGE)),
+            ],
+        ),
+    ]
+    with ThreadPoolExecutor(max_workers=len(sections)) as executor:
+        futures = [
+            executor.submit(fetch_news_section, key, label, primary, fallbacks, limit)
+            for key, label, primary, fallbacks in sections
+        ]
+        for future in futures:
+            key, items, status, source = future.result()
+            news_data[key] = items
+            news_data['status'][key] = status
+            news_data['feed_sources'][key] = source
 
     # Both columns show the same number of cards whenever both have content.
     if news_data['unnews'] and news_data['toutiao']:
@@ -1487,7 +1686,12 @@ def get_news():
         news_data['toutiao'] = news_data['toutiao'][:shared]
 
     news_data['updated_at'] = datetime.now(timezone.utc).isoformat()
-    return jsonify(news_data)
+    with NEWS_CACHE_LOCK:
+        NEWS_CACHE = news_data
+        NEWS_CACHE_UPDATED_AT = time.monotonic()
+    response = jsonify(news_data)
+    response.headers['Cache-Control'] = 'public, max-age=30, stale-while-revalidate=30'
+    return response
 
 
 if __name__ == '__main__':
